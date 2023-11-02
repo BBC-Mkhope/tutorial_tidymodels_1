@@ -1,0 +1,424 @@
+---
+title: "Data Science with Tidymodels, Workflows and Recipes Tutorial"
+output: 
+  html_notebook:
+    toc: true
+    theme: united
+---
+<!-- from https://www.kirenz.com/post/2020-12-19-r-tidymodels-housing/ -->
+
+<!--
+#############################################################################
+# In this example, our goal is to build a model of housing prices in        #
+# California. In particular, the model should learn from California census  #
+# data and be able to predict the median house price in any district        #
+# (population of 600 to 3000 people), given some predictor variables.       #
+# We use the root mean square error (RMSE) as a performance measure for     #
+# our regression problem.                                                   #
+#############################################################################
+-->
+<!-- Libraries -->
+```{r shelving-libraries}
+#
+librarian::shelf( here  # file organization
+                  , tidyverse # general data wrangling  * warning for tibble
+                  , tidymodels # tidymodels component packages **
+                  , skimr   # EDA tools
+                  , GGally  # extension to ggplot2 **
+                  , ggmap   # spatial visualization with ggplot2 **
+                  , httr  # working with URLs in fetching mapping data
+                  , beepr # sound alert
+)
+# * built under R version 4.2.3
+# ** built under R version 4.3.1
+# 
+beep( 1)
+# 
+# 
+```
+
+<!-- Global Options -->
+```{r global-options}
+#
+options("scipen" = 100, "digits" = 6) # override R's tendency to use
+# scientific notation
+beep( 1)
+#
+#
+```
+
+<!-- 
+################################################################
+#####               1 Understanding the Data                ####
+################################################################
+# Here, we will 
+#   1) Import data                                             #
+#   2) Get and overview about the data                         #
+#   3) Discover and visualize the data to gain insights        #
+################################################################
+-->
+
+<!-- ### 1.1 Import data ### -->
+```{r importing-data, results='asis'}
+LINK <- "https://raw.githubusercontent.com/kirenz/datasets/master/housing.csv"
+housing_df <- read_csv( LINK)
+#
+beep( 1)
+#
+#
+```
+<!-- ### 1.2 Data overview ### -->
+```{r data-overview, results='asis'}
+# A look at first 4 rows of data
+head( housing_df, 4)
+# Data info using a {tidyverse} function
+glimpse( housing_df)
+# Summary of data attributes using {skimr}
+skim( housing_df)
+# Count levels of our categorical variable:
+housing_df %>%
+    count( ocean_proximity
+           , sort = TRUE)
+#
+#
+beep( 1)
+# 
+# 
+```
+
+<!--
+The function ggscatmat from the package GGally creates a matrix with scatterplots, densities and correlations for numeric columns. In our 
+code, we enter the dataset housing_df, choose columns 6 to 9, a color 
+column for our categorical variable ocean_proximity, and an alpha 
+level of 0.8 (for a little transparency).
+-->
+```{r correlation-visuals, results='asis'}
+# scatterplot and density matrix for columns 6-9 and color-coding by
+# the categorical variable ocean_proximity
+ggscatmat( housing_df
+           , columns = 6:9
+           , color = 'ocean_proximity'
+           , alpha = 0.8)
+#
+#
+beep( 1)
+# 
+# 
+```
+
+
+<!--
+To obtain an overview of even more visualizations, we can use the function ggpairs.
+-->
+```{r another-corr-matrix, results='asis'}
+#
+ggpairs( housing_df)
+#
+#
+beep( 1)
+# 
+# 
+```
+
+<!-- ### 1.3 Data exploration ### -->
+```{r geo-scatterplot, results='asis'}
+#
+housing_df %>%
+    ggplot( aes( x = longitude
+                 , y = latitude)) +
+    geom_point( color = "cornflowerblue")
+#
+#
+beep( 1)
+#
+#
+```
+
+<!-- Scatterplot color coded by housing price and density -->
+```{r geo-detail-scatterplot, results='asis'}
+# California housing prices:
+#   red is expensive,
+#   purple is cheap and
+#   larger circles indicate areas with a larger population.
+housing_df %>%
+    ggplot( aes( x = longitude
+                 , y = latitude)) +
+    geom_point( aes( size = population
+                     , color = median_house_value)
+                , alpha = 0.4) +
+    scale_colour_gradientn( colours = rev( rainbow( 4)))
+#
+#
+beep( 1)
+#
+#
+```
+
+<!-- Skip this until mapping URL is resolved -->
+
+<!-- Topographical map overlay of scatterplot color coded by housing price and density -->
+```{r topo-detail-scatterplot, results='asis'}
+# Using {ggmap}
+# California housing prices:
+#   red is expensive,
+#   purple is cheap and
+#   larger circles indicate areas with a larger population.
+#   
+#   Might have to use a specific function to avoid fetching error:
+set_config( use_proxy( url = "10.3.100.207"
+                       , port = 8080))
+# plot
+qmplot(x = longitude, 
+       y = latitude, 
+       data = housing_df, 
+       geom = "point", 
+       color = median_house_value, 
+       size = population,
+       alpha = 0.4) +
+  scale_colour_gradientn(colours=rev(rainbow(4)))
+#
+#
+beep( 1)
+#
+#
+```
+
+<!-- 
+################################################################
+#####                   2 Data Preparation                  ####
+################################################################
+# Before we build our model, we first split data into training #
+# and test set using stratified sampling.                      #
+#                                                              #
+# Let’s assume we would know that the median income is a very  #
+# important attribute to predict median housing prices.        #
+# Therefore, we would want to create a training and test set   #
+# using stratified sampling.                                   #
+#                                                              #
+# A stratum (plural strata) refers to a subset (part) of the   #
+# population (entire collection of items under consideration)  #
+# which is being sampled:                                      #
+################################################################
+-->
+
+<!-- Let's take a look at the distribution of median income. -->
+```{r median-income-histogram, results='asis'}
+# 
+housing_df %>%
+    ggplot( aes( median_income)) +
+    geom_histogram( bins = 30)
+#
+#
+beep( 1)
+#
+#
+```
+<!-- ### 2.1 Data Splitting ### -->
+<!--
+# We want to ensure that the test set is representative of the 
+# various categories of incomes in the whole dataset. In other 
+# words, we would like to have instances for each stratum, or 
+# else the estimate of a stratum’s importance may be biased. 
+# This means that you should not have too many strata, and 
+# each stratum should be large enough. We use 5 strata in our 
+# example.
+-->
+```{r training-testing-split, results='asis'}
+# 
+set.seed( 42)
+#
+new_split <- initial_split( housing_df
+                            , prop = 3/4
+                            , strata = median_income
+                            , breaks = 5)
+new_train <- training( new_split)
+new_test <- testing( new_split)
+#
+#
+beep( 1)
+#
+#
+
+```
+
+
+<!-- ### 2.2 Recipes ### -->
+
+<!-- 
+# 
+# Next, we use a recipe() to build a set of steps for data pre-processing 
+# and feature engineering.
+# 
+# Recipes are built as a series of pre-processing steps, such as:
+#     . converting qualitative predictors to indicator variables (also 
+#         known as dummy variables),
+#     . transforming data to be on a different scale (e.g., taking the
+#         logarithm of a variable),
+#     . transforming whole groups of predictors together,
+#     . extracting key features from raw variables (e.g., getting the 
+#         day of the week out of a date variable),
+# 
+# In summary, the idea of the recipes package is to define a recipe 
+# or blueprint that can be used to sequentially define the encodings 
+# and pre-processing of the data (i.e. “feature engineering”) before 
+# we build our models.
+#
+-->
+
+```{r preprocess-recipe, results='asis'}
+# In this recipe
+# 1. First, we must tell the recipe() what our model is going to be 
+#   (using a formula here) and what our training data is.
+# 2. step_novel() will convert all nominal variables to factors.
+# 3. We then convert the factor columns into (one or more) numeric
+#   binary (0 and 1) variables for the levels of the training data.
+# 4. We remove any numeric variables that have zero variance.
+# 5. We normalize (center and scale) the numeric variables.
+# 
+housing_rec <-
+    recipe( median_house_value ~ .
+            , data = new_train) %>%
+    step_novel( all_nominal()) %>%
+    step_dummy( all_nominal()) %>%
+    step_zv(all_predictors()) %>%
+  step_normalize(all_predictors())
+#
+housing_rec
+#
+#
+beep( 1)
+#
+#
+```
+
+<!-- Specifying and fitting the models -->
+
+<!-- 
+################################################################
+#####                   3 Model Building                    ####
+################################################################
+-->
+
+<!-- ### 3.1 Model Specification ### 
+    1. Pick a model type: choose from this list                  
+    2. Set the engine: choose from this list                     
+    3. Set the mode: regression or classification                
+-->
+```{r}
+# Using {tidymodels}
+lm_spec <- # your model specification
+    linear_reg() %>%    # model type
+    set_engine( engine = "lm") %>%  # model engine
+    set_mode( "regression") # model mode
+# Show model specification
+lm_spec
+#
+#
+beep( 2)
+#
+#
+```
+
+<!-- ### 3.2 Creating the Workflow ### 
+# To combine the data preparation with the model building, we 
+# use {workflow}.
+
+# A workflow is an object that can bundle together your 
+# pre-processing, modeling, and post-processing requests                
+-->
+```{r creating-workflow, results='asis'}
+#
+lm_wflow <-
+    workflow() %>%
+    add_model( lm_spec) %>%
+    add_recipe( housing_rec)
+#
+#
+beep( 1)
+#
+#
+```
+
+<!-- ### 3.3 Evaluate the Model ### 
+# We build a validation set with K-fold cross-validation.#               
+-->
+```{r model-eval, results='asis'}
+#
+set.seed( 111)
+#
+cv_folds <-
+    vfold_cv( new_train
+              , v = 5
+              , strata = median_income
+              , breaks = 5)
+# Show the folds
+cv_folds
+#
+#
+beep( 1)
+#
+#
+```
+
+<!-- 
+    Fitting the model and collecting the performance metrics with
+    collect_metrics()
+-->
+```{r fitting-model, results='asis'}
+#
+lm_wflow_eval <-
+    lm_wflow %>%
+    fit_resamples(
+        median_house_value ~ .
+        , resamples = cv_folds
+    )
+#
+lm_wflow_eval %>%
+    collect_metrics()
+#
+#
+beep( 3)
+#
+#
+```
+
+<!--
+    # Note: 
+        Usually, we would fit multiple models and select the 
+        one with the smallest RMSE. In this example, we only 
+        demonstrate the process with one model.
+-->
+
+<!-- ### 3.4 Last Fit and Evaluation ### -->
+
+<!-- Fit the best model to the training set and evaluate the
+    test set with the function last_fit()
+-->
+```{r last-fit-eval, results='asis'}
+# 
+last_fit_lm <- last_fit( lm_wflow
+                         , split = new_split)
+# 
+# Show RMSE and RSQ
+last_fit_lm %>%
+    collect_metrics()
+# 
+# 
+beep( 2)
+# 
+# 
+```
+
+
+<!-- Unshelving libraries -->
+```{r unshelving-libraries}
+#
+librarian::unshelf( here  # file organization
+                  , tidyverse # general data wrangling  * warning for tibble
+                  , tidymodels # tidymodels component packages **
+                  , skimr   # EDA tools
+                  , GGally  # extension to ggplot2 **
+                  , ggmap   # spatial visualization with ggplot2 **
+                  , beepr # sound alert
+)
+```
